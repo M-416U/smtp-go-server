@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"net/smtp"
+	"os"
 	"strings"
+	"time"
+
+	"gopkg.in/gomail.v2"
 )
 
 type EmailRequest struct {
@@ -27,7 +30,24 @@ type EmailResponse struct {
 	Error   string `json:"error,omitempty"`
 }
 
-// const encryptionKey = "UcbAwJGtV3N36JQeDRJNFzf0jYTQWHNhp9hLxk2GLP8="
+// Initialize logger
+var logger *log.Logger
+
+func init() {
+	// Create logs directory if it doesn't exist
+	if err := os.MkdirAll("logs", 0755); err != nil {
+		log.Fatal("Failed to create logs directory:", err)
+	}
+
+	// Open log file with current timestamp
+	logFileName := fmt.Sprintf("logs/email_server_%s.log", time.Now().Format("2006-01-02"))
+	logFile, err := os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatal("Failed to open log file:", err)
+	}
+
+	logger = log.New(logFile, "", log.Ldate|log.Ltime|log.Lshortfile)
+}
 
 func enableCors(w *http.ResponseWriter) {
 	(*w).Header().Set("Access-Control-Allow-Origin", "*")
@@ -35,20 +55,8 @@ func enableCors(w *http.ResponseWriter) {
 	(*w).Header().Set("Access-Control-Allow-Headers", "Content-Type")
 }
 
-// func decryptPassword(encryptedPassword string) (string, error) {
-// 	ciphertext, _ := base64.StdEncoding.DecodeString(encryptedPassword)
-// 	block, err := aes.NewCipher([]byte(encryptionKey))
-// 	if err != nil {
-// 		return "", err
-// 	}
-// 	iv := ciphertext[:aes.BlockSize]
-// 	ciphertext = ciphertext[aes.BlockSize:]
-// 	stream := cipher.NewCFBDecrypter(block, iv)
-// 	stream.XORKeyStream(ciphertext, ciphertext)
-// 	return string(ciphertext), nil
-// }
-
 func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
+	logger.Printf("Received new email request from %s", r.RemoteAddr)
 	enableCors(&w)
 
 	// Handle preflight OPTIONS request
@@ -58,26 +66,33 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method != http.MethodPost {
+		logger.Printf("Invalid request method: %s", r.Method)
 		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
 		return
 	}
 
 	var emailReq EmailRequest
 	if err := json.NewDecoder(r.Body).Decode(&emailReq); err != nil {
+		logger.Printf("Failed to decode JSON payload: %v", err)
 		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
 		return
 	}
 
 	if emailReq.SmtpUserName == "" {
+		logger.Print("SmtpUserName is required")
 		http.Error(w, "SmtpUserName is required", http.StatusBadRequest)
 		return
 	}
 
-	// decryptedPassword, err := decryptPassword(emailReq.SmtpPassword)
-	// if err != nil {
-	// 	http.Error(w, "Failed to decrypt password", http.StatusInternalServerError)
-	// 	return
-	// }
+	logger.Printf("Preparing to send email(s) via SMTP host: %s:%d", emailReq.SmtpHost, emailReq.SmtpPort)
+
+	m := gomail.NewMessage()
+	m.SetHeader("From", emailReq.SmtpUserName)
+	m.SetHeader("Subject", emailReq.EmailSubject)
+	m.SetBody("text/html", emailReq.EmailBody)
+
+	d := gomail.NewDialer(emailReq.SmtpHost, emailReq.SmtpPort, emailReq.SmtpUserName, emailReq.SmtpPassword)
+	d.SSL = emailReq.UseSSL
 
 	emails := []string{emailReq.SmtpUserName}
 	if emailReq.EmailToId != "" {
@@ -88,17 +103,23 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 
 	for _, email := range emails {
 		email = strings.TrimSpace(email)
-		to := []string{email}
-		subject := fmt.Sprintf("Subject: %s\r\n", emailReq.EmailSubject)
-		body := fmt.Sprintf("To: %s\r\n%s\r\n\r\n%s", emailReq.EmailToName, subject, emailReq.EmailBody)
-		auth := smtp.PlainAuth("", emailReq.SmtpUserName, emailReq.SmtpPassword, emailReq.SmtpHost)
-		serverAddr := fmt.Sprintf("%s:%d", emailReq.SmtpHost, emailReq.SmtpPort)
+		logger.Printf("Attempting to send email to: %s", email)
 
-		err := smtp.SendMail(serverAddr, auth, emailReq.SmtpUserName, to, []byte(body))
-		if err != nil {
-			responses = append(responses, EmailResponse{Email: email, Success: false, Error: err.Error()})
+		m.SetHeader("To", email)
+
+		if err := d.DialAndSend(m); err != nil {
+			logger.Printf("Failed to send email to %s: %v", email, err)
+			responses = append(responses, EmailResponse{
+				Email:   email,
+				Success: false,
+				Error:   err.Error(),
+			})
 		} else {
-			responses = append(responses, EmailResponse{Email: email, Success: true})
+			logger.Printf("Successfully sent email to: %s", email)
+			responses = append(responses, EmailResponse{
+				Email:   email,
+				Success: true,
+			})
 		}
 	}
 
@@ -107,9 +128,14 @@ func sendEmailHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	logger.Print("Starting email server...")
+
 	http.HandleFunc("/send-email", sendEmailHandler)
-	fmt.Println("Starting server on :8000...")
-	if err := http.ListenAndServe(":8000", nil); err != nil {
-		log.Fatal(err)
+
+	serverAddr := ":8000"
+	logger.Printf("Server listening on %s", serverAddr)
+
+	if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		logger.Fatal("Server failed to start:", err)
 	}
 }
